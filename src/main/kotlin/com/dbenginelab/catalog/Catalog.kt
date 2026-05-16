@@ -76,6 +76,8 @@ class Catalog(private val metaPath: String) {
             dos.writeByte(col.type.ordinal)
             dos.writeBoolean(col.nullable)
         }
+        dos.writeInt(schema.constraints.size)
+        for (c in schema.constraints) writeConstraint(dos, c)
     }
 
     private fun readSchema(dis: DataInputStream): TableSchema {
@@ -87,7 +89,51 @@ class Catalog(private val metaPath: String) {
             val nullable = dis.readBoolean()
             ColumnDef(colName, type, nullable)
         }
-        return TableSchema(name, cols)
+        val constraintCount = dis.readInt()
+        val constraints = (0 until constraintCount).map { readConstraint(dis) }
+        return TableSchema(name, cols, constraints)
+    }
+
+    private fun writeConstraint(dos: DataOutputStream, c: Constraint) {
+        when (c) {
+            is Constraint.PrimaryKey -> {
+                dos.writeByte(0)
+                writeStringList(dos, c.columns)
+            }
+            is Constraint.Unique -> {
+                dos.writeByte(1)
+                writeStringList(dos, c.columns)
+            }
+            is Constraint.ForeignKey -> {
+                dos.writeByte(2)
+                writeStringList(dos, c.columns)
+                writeString(dos, c.refTable)
+                writeStringList(dos, c.refColumns)
+            }
+        }
+    }
+
+    private fun readConstraint(dis: DataInputStream): Constraint {
+        return when (dis.readByte().toInt()) {
+            0 -> Constraint.PrimaryKey(readStringList(dis))
+            1 -> Constraint.Unique(readStringList(dis))
+            2 -> Constraint.ForeignKey(
+                columns = readStringList(dis),
+                refTable = readString(dis),
+                refColumns = readStringList(dis),
+            )
+            else -> error("unknown constraint tag")
+        }
+    }
+
+    private fun writeStringList(dos: DataOutputStream, list: List<String>) {
+        dos.writeInt(list.size)
+        list.forEach { writeString(dos, it) }
+    }
+
+    private fun readStringList(dis: DataInputStream): List<String> {
+        val n = dis.readInt()
+        return (0 until n).map { readString(dis) }
     }
 
     private fun writeString(dos: DataOutputStream, s: String) {
