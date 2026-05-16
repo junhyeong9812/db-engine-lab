@@ -46,6 +46,32 @@ class BTreeIndex(
         }
     }
 
+    /**
+     * Range scan: returns all (key, value) pairs where [fromInclusive] <= key < [toExclusive],
+     * in key ascending order. Uses leaf sibling pointers (auxPage on leaves).
+     */
+    fun rangeScan(fromInclusive: Long, toExclusive: Long): List<Pair<Long, Long>> {
+        require(fromInclusive <= toExclusive) { "fromInclusive ($fromInclusive) > toExclusive ($toExclusive)" }
+        val result = mutableListOf<Pair<Long, Long>>()
+        var leafPageNo = findLeafPage(fromInclusive)
+        while (leafPageNo != BTreePage.INVALID) {
+            val page = bufferPool.fetchPage(PageId(pagedFile.fileId, leafPageNo))
+            try {
+                val btp = BTreePage(page)
+                val startSlot = btp.findSlot(fromInclusive)
+                for (i in startSlot until btp.keyCount) {
+                    val k = btp.keyAt(i)
+                    if (k >= toExclusive) return result
+                    result.add(k to btp.valueAt(i))
+                }
+                leafPageNo = btp.auxPage
+            } finally {
+                bufferPool.unpinPage(page.id, isDirty = false)
+            }
+        }
+        return result
+    }
+
     /** Returns total number of (key, value) entries across all leaves. */
     fun size(): Int {
         var total = 0

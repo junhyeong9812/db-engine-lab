@@ -129,6 +129,40 @@ class BTreeIndexTest {
     }
 
     @Test
+    fun `range scan은 정렬 순서로 in-range 키만 반환`(@TempDir tempDir: Path) {
+        val path = tempDir.resolve("btree.db").toString()
+        PagedFile(path).use { pf ->
+            BufferPool(pf, capacity = 32).use { bp ->
+                val idx = BTreeIndex(pf, bp)
+                for (k in 1L..400L) idx.insert(k, k * 2)
+
+                val r = idx.rangeScan(100L, 200L)
+                assertEquals(100, r.size)
+                assertEquals(100L to 200L, r.first())
+                assertEquals(199L to 398L, r.last())
+            }
+        }
+    }
+
+    @Test
+    fun `range scan은 leaf 경계를 넘어 sibling pointer 따라간다`(@TempDir tempDir: Path) {
+        val path = tempDir.resolve("btree.db").toString()
+        PagedFile(path).use { pf ->
+            BufferPool(pf, capacity = 32).use { bp ->
+                val idx = BTreeIndex(pf, bp)
+                val n = BTreePage.MAX_ENTRIES + 200  // split 다회 발생
+                for (k in 1..n) idx.insert(k.toLong(), k.toLong())
+
+                val r = idx.rangeScan(1L, (n + 1).toLong())
+                assertEquals(n, r.size)
+                for (i in 0 until n) {
+                    assertEquals((i + 1).toLong() to (i + 1).toLong(), r[i])
+                }
+            }
+        }
+    }
+
+    @Test
     fun `split 후 reopen해도 일관성 유지`(@TempDir tempDir: Path) {
         val path = tempDir.resolve("btree.db").toString()
         val n = BTreePage.MAX_ENTRIES + 100
