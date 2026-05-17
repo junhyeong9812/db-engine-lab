@@ -1,170 +1,94 @@
-# impl/02-01 — Page (mutable byte container) + PagedFile
+# impl/02-01 — Page + PagedFile (한 줄 한 줄)
 
-> 상위 단계: `docs/stages/02-page-buffer.md`
-> 이 세션의 범위: PageId, Page (mutable, dirty/pin), PagedFile (page 단위 IO).
-> 예상 타이핑 시간: 30~40분.
-> **✅ Claude 검증 완료 (2026-05-16): `./gradlew test` PagedFileTest 4 PASSED.**
+> 상위: `docs/stages/02-page-buffer.md`
+> **검증**: PagedFileTest 4 PASSED.
+> 작성 파일:
+> - 신규: `src/main/kotlin/com/dbenginelab/storage/PageId.kt`
+> - 신규: `src/main/kotlin/com/dbenginelab/storage/Page.kt`
+> - 신규: `src/main/kotlin/com/dbenginelab/storage/PagedFile.kt`
+> - 신규: `src/test/kotlin/com/dbenginelab/storage/PagedFileTest.kt`
 
----
+## 0. 참조
+- SimpleDB `HeapPage.java`, `BufferPool.java` 상위 절반.
+- BusTub `disk_manager.cpp`, `page.h` (차이: BusTub은 처음부터 latch 포함, 우리는 단계 9 lock에서 도입).
 
-## 0. 참조 출처
-
-### 주 참조 (SimpleDB)
-- 파일: `simpledb/storage/HeapPage.java`, `BufferPool.java` (상위 절반).
-- 클래스/메서드: `HeapPage(HeapPageId, byte[])`, `BufferPool.getPage()` (구조 참고).
-- 우리 코드 대응: `Page(PageId, ByteArray)`, `PagedFile.readPage/writePage`.
-
-### 대조 참조 (BusTub)
-- 파일: `src/storage/disk/disk_manager.cpp`, `src/include/storage/page/page.h`.
-- 차이: BusTub Page는 lock/latch 필드 포함 (단계 9에서 도입). 우리는 단계 2에서 latch 미도입.
-
-### 핵심 설계 결정 근거
-- **Page는 `class` (data class 아님)** — `ByteArray`가 mutable이라 자동 equals/hashCode가 거짓말이 됨 (codex 보정 1, constraints.md).
-- **PageId는 `data class` OK** — 값 객체, immutable, equals/hashCode가 올바름.
-- **`require()`로 invariant 강제** — Page size 위반은 즉시 fail.
-
----
-
-## 1. 만족시킬 invariant
-- **I-1**: writePage(p) → sync → reopen → readPage(p) 시 동일 byte.
-- **I-2**: Page size는 모든 페이지에서 동일 (`Page.PAGE_SIZE = 4096`).
-- **I-3**: pageCount() = allocate된 누적 횟수.
-
----
+## 1. invariant
+- I-4: writePage → sync → reopen → readPage 결과 동일.
+- I-5: 모든 page 크기 = `Page.PAGE_SIZE` (4096).
+- I-6: pageCount() = allocatePage 누적 횟수.
 
 ## 2. 의존성
-- 이전 세션: 01-01 (Record/AppendOnlyFile/StorageError) — StorageError 확장에 사용.
-- 외부: `java.io.RandomAccessFile`.
+- 01-01 (StorageError 확장 — PageNotFound 추가).
 
----
+## 3. 구현 코드 — 한 줄 한 줄
 
-## 3. 문제 정의
-
-단계 1의 raw record append는 **메모리 한계**와 **고정 단위 IO 부재**라는 두 가지 한계가 있다. 거대한 record는 한 번에 메모리에 로드되고, OS·디스크 IO 단위와 어긋난다.
-
-해결: **고정 크기 page (4KB) 단위로 분할 + IO**. 모든 read/write는 page 단위로.
-
----
-
-## 4. 실패 테스트 (TDD step 2)
+### 3.1 `PageId.kt`
 
 ```kotlin
 package com.dbenginelab.storage
 
-import org.junit.jupiter.api.Test
-import org.junit.jupiter.api.io.TempDir
-import java.nio.file.Path
-import kotlin.test.assertContentEquals
-import kotlin.test.assertEquals
-import kotlin.test.assertFailsWith
-
-class PagedFileTest {
-
-    @Test
-    fun `writePage 후 reopen하면 같은 내용 read`(@TempDir tempDir: Path) {
-        val path = tempDir.resolve("paged.db").toString()
-        val pid: PageId
-        PagedFile(path).use { pf ->
-            pid = pf.allocatePage()
-            val page = pf.readPage(pid)
-            val payload = "hello-page".toByteArray()
-            page.write(0, payload)
-            pf.writePage(page)
-            pf.sync()
-        }
-        PagedFile(path).use { pf ->
-            val page = pf.readPage(pid)
-            assertContentEquals("hello-page".toByteArray(), page.read(0, "hello-page".length))
-        }
-    }
-}
-```
-
-**실행 결과**: `Unresolved reference: PageId / Page / PagedFile`. 5번에서 구현.
-
----
-
-## 5. 구현 코드
-
-### 5.1 `PageId.kt`
-
-```kotlin
-package com.dbenginelab.storage
-
-// Q: 왜 data class? Page는 일반 class였는데 차이가 뭔가?
+// Q: 왜 data class? Page는 일반 class였는데 차이는?
 data class PageId(val fileId: Int, val pageNumber: Int) {
     companion object {
-        const val INVALID_PAGE_NUMBER: Int = -1
+        const val INVALID_PAGE_NUMBER: Int = -1                      // root 없음 등 sentinel
     }
 }
 // <details><summary>A</summary>
-//
-// PageId는 immutable 값 객체 (식별자) — equals/hashCode가 값 동일성으로 동작해야 BufferPool의 HashMap key로 정확.
+// PageId는 immutable 값 객체 (식별자) — equals/hashCode가 값 동일성으로. BufferPool의 HashMap key로 정확.
 // </details>
 ```
 
-### 5.2 `Page.kt`
+### 3.2 `Page.kt`
 
 ```kotlin
 package com.dbenginelab.storage
 
 class Page(
-    val id: PageId,
-    private val data: ByteArray,
+    val id: PageId,                                                   // 어떤 page인지 식별
+    private val data: ByteArray,                                      // 실제 byte 내용
 ) {
-    var isDirty: Boolean = false
-        private set
+    var isDirty: Boolean = false                                      // BufferPool eviction 시 fsync 판단
+        private set                                                   // 외부 직접 set 금지
 
-    var pinCount: Int = 0
+    var pinCount: Int = 0                                             // 사용 중 page는 evict 금지
         private set
 
     init {
-        // Q: 이 require가 빠지면 어떤 입력에서 깨지는가?
+        // Q: 이 require 빠지면 어떤 입력에서 깨지나?
         require(data.size == PAGE_SIZE) {
             "Page data size must be exactly $PAGE_SIZE bytes (got ${data.size})"
         }
         // <details><summary>A</summary>
-        //
-        // 외부에서 잘못된 크기 ByteArray 넘기면 writePage 시 page boundary 어긋나 후속 page 손상 — invariant I-2 즉시 위반.
+        // 외부에서 잘못된 크기 ByteArray 넘기면 writePage 시 page boundary 어긋남 → 후속 page 손상. invariant I-5 즉시 위반.
         // </details>
     }
 
     fun read(offset: Int, length: Int): ByteArray {
-        checkRange(offset, length)
-        return data.copyOfRange(offset, offset + length)
+        checkRange(offset, length)                                    // 경계 검증
+        return data.copyOfRange(offset, offset + length)              // 방어 복사 — 외부 변경 차단
     }
 
     fun write(offset: Int, bytes: ByteArray) {
         checkRange(offset, bytes.size)
-        // Q: 왜 System.arraycopy를 직접 호출? Kotlin idiomatic copyInto가 있는데.
+        // Q: 왜 System.arraycopy 직접? Kotlin idiom (copyInto)이 있는데?
         System.arraycopy(bytes, 0, data, offset, bytes.size)
         // <details><summary>A</summary>
-        //
-        // 둘 다 동작하지만, System.arraycopy는 JVM intrinsic이라 hot path에서 더 빠름. 학습 코드에서 의도 명확.
+        // System.arraycopy는 JVM intrinsic — hot path에서 더 빠름. 학습 코드 의도 명확.
         // </details>
-        isDirty = true
+        isDirty = true                                                // write되면 자동 dirty
     }
 
-    fun rawData(): ByteArray = data
+    fun rawData(): ByteArray = data                                   // PagedFile.writePage가 사용 (방어 복사 안 함)
 
-    fun markDirty() {
-        isDirty = true
-    }
+    fun markDirty() { isDirty = true }                                // 수동 dirty 표시
+    fun markClean() { isDirty = false }                               // flush 후 호출
 
-    fun markClean() {
-        isDirty = false
-    }
-
-    fun pin() {
-        pinCount++
-    }
-
+    fun pin() { pinCount++ }                                          // 사용 시작
     fun unpin() {
-        // Q: pinCount가 0인데 unpin 호출되면 어떤 상태?
+        // Q: pinCount=0인데 unpin 호출되면?
         check(pinCount > 0) { "unpin called on un-pinned page ${id}" }
         // <details><summary>A</summary>
-        //
-        // pin/unpin 짝이 안 맞는 버그 — BufferPool 사용자가 unpin 두 번 호출하면 evict 가능한 페이지가 잘못 표시됨. 즉시 fail이 안전.
+        // pin/unpin 짝 안 맞으면 BufferPool에서 evict 가능한 page를 잘못 판단. 즉시 fail이 안전.
         // </details>
         pinCount--
     }
@@ -176,12 +100,12 @@ class Page(
     }
 
     companion object {
-        const val PAGE_SIZE: Int = 4096
+        const val PAGE_SIZE: Int = 4096                               // OS page와 일치 — fsync 단위 최소화
     }
 }
 ```
 
-### 5.3 `PagedFile.kt`
+### 3.3 `PagedFile.kt`
 
 ```kotlin
 package com.dbenginelab.storage
@@ -189,21 +113,20 @@ package com.dbenginelab.storage
 import java.io.Closeable
 import java.io.RandomAccessFile
 
-class PagedFile(path: String, val fileId: Int = 0) : Closeable {
+class PagedFile(path: String, val fileId: Int = 0) : Closeable {     // fileId — 다중 파일 시점에 의미
 
     private val file: RandomAccessFile = RandomAccessFile(path, "rw")
 
-    fun pageCount(): Int = (file.length() / Page.PAGE_SIZE).toInt()
+    fun pageCount(): Int = (file.length() / Page.PAGE_SIZE).toInt()  // 전체 page 수 = 파일 크기 / page size
 
     fun allocatePage(): PageId {
-        val newPageNumber = pageCount()
-        // Q: 왜 zero-filled로 미리 채우는가? 그냥 length만 늘리면 안 되나?
+        val newPageNumber = pageCount()                               // 새 page = 끝 + 1
+        // Q: 왜 zero-fill 미리? 그냥 length만 늘리면 안 되나?
         val zeroes = ByteArray(Page.PAGE_SIZE)
         file.seek(file.length())
         file.write(zeroes)
         // <details><summary>A</summary>
-        //
-        // sparse file은 OS·FS별 동작이 다르고, 후속 read에서 random garbage가 나올 수 있음. 명시적 zero가 안전 (단계 8 WAL의 page version 자리 미리 확보).
+        // sparse file은 OS/FS별 동작 다름 — 후속 read에서 random garbage 가능. 명시 zero가 안전 (단계 8 WAL이 page header 사용 시 더 중요).
         // </details>
         return PageId(fileId, newPageNumber)
     }
@@ -214,59 +137,40 @@ class PagedFile(path: String, val fileId: Int = 0) : Closeable {
         }
         val totalPages = pageCount()
         if (id.pageNumber < 0 || id.pageNumber >= totalPages) {
-            // Q: 왜 sealed error로? null 반환이나 IllegalArgumentException은 안 되나?
+            // Q: 왜 sealed error? null 반환 안 되나?
             throw StorageError.PageNotFound(id)
             // <details><summary>A</summary>
-            //
-            // 단계 8 recovery에서 "없음"과 "잘못된 호출"을 다르게 처리해야 함 — sealed로 의미 분리 (constraints.md Kotlin 규칙).
+            // 단계 8 recovery가 "없음"과 "잘못된 호출"을 다르게 처리 — sealed로 의미 분리.
             // </details>
         }
         val buf = ByteArray(Page.PAGE_SIZE)
-        file.seek(id.pageNumber.toLong() * Page.PAGE_SIZE)
-        file.readFully(buf)
+        file.seek(id.pageNumber.toLong() * Page.PAGE_SIZE)            // page boundary로 seek
+        file.readFully(buf)                                           // 정확히 PAGE_SIZE 읽음
         return Page(id, buf)
     }
 
     fun writePage(page: Page) {
-        require(page.id.fileId == fileId) {
-            "PageId fileId=${page.id.fileId} does not match this file fileId=$fileId"
-        }
+        require(page.id.fileId == fileId)
         file.seek(page.id.pageNumber.toLong() * Page.PAGE_SIZE)
-        file.write(page.rawData())
+        file.write(page.rawData())                                    // 정확히 PAGE_SIZE 씀
     }
 
-    fun sync() {
-        file.fd.sync()
-    }
+    fun sync() { file.fd.sync() }                                     // OS buffer → disk
 
-    override fun close() {
-        file.close()
-    }
+    override fun close() { file.close() }
 }
 ```
 
----
+## 4. 검증 (4 PASSED)
+- allocate → zero-fill page
+- writePage → reopen → 같은 내용
+- 존재하지 않는 page read → PageNotFound
+- pageCount = allocate 횟수
 
-## 6. 검증 테스트
+## 5. 깨뜨릴 과제
+- PAGE_SIZE를 4097로 — OS page와 어긋난 비효율은?
+- allocate에서 zero-fill 제거 — sparse file 어떤 OS에서 깨짐?
+- 두 PagedFile 인스턴스가 같은 path → race?
 
-(이미 `src/test/kotlin/com/dbenginelab/storage/PagedFileTest.kt` 작성됨 — 4개 테스트 PASSED)
-
----
-
-## 7. 직접 깨뜨릴 과제
-
-- 과제 1: PAGE_SIZE를 4096이 아닌 4097로 바꾸면 어떤 테스트가 깨지는가? OS page와 어긋난 게 왜 비효율인가?
-- 과제 2: `allocatePage`에서 zero-fill 안 하고 `file.setLength(newLength)`로만 늘리면 어떤 환경에서 깨지는가?
-- 과제 3: 두 PagedFile 인스턴스를 같은 path로 동시에 열면 어떻게 되는가? 어디서 race가 발생할 수 있는가?
-
----
-
-## 8. 다음 한계
-
-- BufferPool 없이 매번 page IO → 메모리 cache 없음. → **02-02 BufferPool**.
-
----
-
-| 날짜 | 변경 |
-|------|------|
-| 2026-05-16 | 초안 — Claude 검증 완료 |
+## 6. 다음 한계
+- 매번 IO → 캐시 없음 → **02-02 BufferPool**.

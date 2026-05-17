@@ -17,11 +17,21 @@
 참조 정책: **옵션 A'**. `docs/reference-policy.md`.
 세션 인계: 가장 최근 = `docs/handoff/stage-01-handoff.md`.
 
-진행 상태:
-- [x] 단계 1 storage ✅ (3 tests)
-- [x] 단계 2 page/buffer ✅ (8 tests, 누적 11)
-- [ ] 단계 3 index (진입)
-- [ ] 단계 4~21
+진행 상태 — **전체 완료. 89/89 tests PASSED.**
+
+Phase A (1~13):
+- [x] 1 storage / [x] 2 page+buffer / [x] 3 BTree (3-1/3-2/3-3)
+- [x] 4 catalog / [x] 5 constraints / [x] 6 query API (6-1/6-2/6-3)
+- [x] 7 WorkUnit / [x] 8 WAL+Recovery (진짜 ACID) / [x] 9-1 LockManager
+- [x] 10 MVCC / [x] 11 Optimizer / [x] 12 SQL Parser / [x] 13 ConnectionPool
+
+Phase B (14~21):
+- [x] 14 wire / [x] 15 auth / [x] 16 backup / [x] 17 monitoring
+- [x] 18 replication / [x] 19 online DDL / [x] 20 admin CLI / [x] 21 sharding stub
+
+impl/ 26 책 (각 단계 검증 직후 작성 — (b) 사이클).
+handoff/ 22 (stage-00 ~ stage-21).
+issues-log 1건 (ISSUE-001 B+tree separator navigation).
 
 ---
 

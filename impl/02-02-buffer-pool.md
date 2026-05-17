@@ -1,132 +1,80 @@
-# impl/02-02 — BufferPool (LRU eviction, pin/unpin)
+# impl/02-02 — BufferPool (한 줄 한 줄)
 
-> 상위 단계: `docs/stages/02-page-buffer.md`
-> 이 세션의 범위: BufferPool — fetchPage/unpinPage/flush/eviction.
-> 예상 타이핑 시간: 30~40분.
-> **✅ Claude 검증 완료: BufferPoolTest 4 PASSED.**
+> 상위: `docs/stages/02-page-buffer.md`
+> **검증**: BufferPoolTest 4 PASSED.
+> 작성 파일:
+> - 수정: `src/main/kotlin/com/dbenginelab/storage/StorageError.kt` (PageNotFound/PageNotInPool/AllPagesPinned 추가)
+> - 신규: `src/main/kotlin/com/dbenginelab/storage/BufferPool.kt`
+> - 신규: `src/test/kotlin/com/dbenginelab/storage/BufferPoolTest.kt`
 
----
-
-## 0. 참조 출처
-
-### 주 참조 (SimpleDB)
-- `simpledb/storage/BufferPool.java` — `getPage`, `evictPage`.
-
-### 대조 참조 (BusTub)
-- `src/buffer/buffer_pool_manager_instance.cpp`, `src/buffer/lru_replacer.cpp`.
-- 차이: BusTub은 LRU-K (project 1 advanced). 우리는 단순 LRU. **단계 13 튜닝 시 LRU-K 검토**.
-
-### 핵심 설계 결정 근거
-- **`LinkedHashMap(capacity, 0.75f, true)` access-order** — Kotlin/Java 표준 라이브러리만으로 LRU 구현. 외부 의존 불필요.
-- **eviction 시 dirty면 fsync 후 evict** — invariant CI-2 (page durability).
-- **모두 pinned면 throw** — silent block보다 명시 fail이 학습 친화.
-
----
+## 0. 참조
+- SimpleDB `BufferPool.getPage`/`evictPage`.
+- BusTub `buffer_pool_manager_instance.cpp`, `lru_replacer.cpp` (단계 13 LRU-K 검토).
 
 ## 1. invariant
-- **CI-1**: 같은 PageId fetch 시 같은 객체 반환 (캐시 일관성).
-- **CI-2**: 모든 dirty page는 evict 또는 flush 전 fsync.
-- **CI-3**: pin된 page는 evict 안 됨.
+- CI-1: 같은 PageId fetch → 같은 객체 (캐시 일관).
+- CI-2: dirty page evict 시 fsync.
+- CI-3: pinned page 절대 evict 안 됨.
 
 ## 2. 의존성
-- 02-01 (PageId, Page, PagedFile).
-- StorageError 확장 (PageNotInPool, AllPagesPinned).
+- 02-01 (Page, PageId, PagedFile).
+- StorageError 확장.
 
----
-
-## 3. 문제 정의
-
-매번 PagedFile에서 page를 읽으면 IO 비용 큼. 자주 쓰는 page를 메모리에 cache하고, 메모리 한계 도달 시 가장 오래 안 쓴 page를 evict.
-
----
-
-## 4. 실패 테스트
+## 3. StorageError.kt 확장
 
 ```kotlin
-@Test
-fun `LRU eviction이 unpinned 페이지를 내보내고 dirty면 flush`(@TempDir tempDir: Path) {
-    val path = tempDir.resolve("bp.db").toString()
-    PagedFile(path).use { pf ->
-        BufferPool(pf, capacity = 2).use { bp ->
-            val a = bp.newPage(); a.write(0, "A".toByteArray()); bp.unpinPage(a.id, true)
-            val b = bp.newPage(); b.write(0, "B".toByteArray()); bp.unpinPage(b.id, true)
-            val c = bp.newPage(); c.write(0, "C".toByteArray()); bp.unpinPage(c.id, true)
-            assertEquals(2, bp.cachedPageCount())
-            bp.flushAll()
-        }
-        // capacity=2였으니 A가 evict됐을 것. evict 시 disk에 flush 됐어야.
-        PagedFile(path).use { pf2 ->
-            val a2 = pf2.readPage(PageId(0, 0))
-            assertContentEquals("A".toByteArray(), a2.read(0, 1))
-            val c2 = pf2.readPage(PageId(0, 2))
-            assertContentEquals("C".toByteArray(), c2.read(0, 1))
-        }
-    }
-}
-```
-
----
-
-## 5. 구현 코드
-
-### 5.1 `StorageError.kt` 확장
-
-```kotlin
-// 기존 sealed class StorageError에 추가:
+// 기존 sealed class StorageError 에 추가
 class PageNotFound(id: PageId) : StorageError("page not found: $id")
 class PageNotInPool(id: PageId) : StorageError("page not in buffer pool: $id")
 class AllPagesPinned(capacity: Int) : StorageError("all $capacity pages are pinned, cannot evict")
 ```
 
-### 5.2 `BufferPool.kt`
+## 4. BufferPool.kt — 한 줄 한 줄
 
 ```kotlin
-package com.dbenginelab.storage
+package com.dbenginelab.storage                                      // storage 패키지
 
 import java.io.Closeable
 
 class BufferPool(
-    private val pagedFile: PagedFile,
-    private val capacity: Int = DEFAULT_CAPACITY,
+    private val pagedFile: PagedFile,                                // 어떤 PagedFile 대상
+    private val capacity: Int = DEFAULT_CAPACITY,                    // 최대 page 수
 ) : Closeable {
 
-    // Q: 왜 LinkedHashMap을 access-order(true)로? 그냥 HashMap은 안 되나?
+    // Q: 왜 LinkedHashMap(_, _, true)? HashMap은 안 되나?
     private val pages: LinkedHashMap<PageId, Page> = LinkedHashMap(capacity, 0.75f, true)
     // <details><summary>A</summary>
-    //
-    // access-order이면 get() 호출이 entry를 가장 뒤로 옮김 — iteration 첫 번째가 가장 오래 안 쓴 page (LRU victim 후보).
+    // access-order=true — get() 호출이 entry를 가장 뒤로 옮김. iteration 첫 번째 = LRU victim 후보. 외부 의존 없이 LRU 구현.
     // </details>
 
     fun fetchPage(id: PageId): Page {
-        pages[id]?.let { cached ->
-            // Q: 이 시점에 pin을 왜 하는가? caller가 직접 pin해도 되지 않나?
+        pages[id]?.let { cached ->                                   // 캐시 hit
+            // Q: 이 시점에 pin 왜?
             cached.pin()
             return cached
             // <details><summary>A</summary>
-            //
-            // fetchPage 반환 직후 다른 fetch가 evict 시도하면 caller의 작업 중에 page가 사라짐 — 반환 전 pin이 race 방어.
+            // 반환 직후 다른 fetch가 evict 시도하면 caller가 쓰는 동안 page 사라짐. 반환 전 pin이 race 방어.
             // </details>
         }
-        if (pages.size >= capacity) {
-            evictOne()
+        if (pages.size >= capacity) {                                // 캐시 full
+            evictOne()                                                // 한 page 내보냄 (LRU)
         }
-        val loaded = pagedFile.readPage(id)
-        loaded.pin()
-        pages[id] = loaded
+        val loaded = pagedFile.readPage(id)                          // disk → memory
+        loaded.pin()                                                  // 반환 전 pin
+        pages[id] = loaded                                            // 캐시 등록
         return loaded
     }
 
     fun newPage(): Page {
-        val id = pagedFile.allocatePage()
+        val id = pagedFile.allocatePage()                            // disk에 새 page 할당
         if (pages.size >= capacity) {
             evictOne()
         }
-        val page = Page(id, ByteArray(Page.PAGE_SIZE))
-        // Q: 새 페이지가 왜 처음부터 dirty인가?
+        val page = Page(id, ByteArray(Page.PAGE_SIZE))               // 빈 Page 객체
+        // Q: 새 page 가 처음부터 dirty?
         page.markDirty()
         // <details><summary>A</summary>
-        //
-        // allocatePage가 zero-fill만 했고 진짜 내용은 caller가 곧 쓸 것. 명시적 dirty가 다음 evict 시 정확한 flush 보장.
+        // allocatePage는 zero-fill만 — 진짜 내용은 caller가 곧 쓸 것. 명시 dirty가 evict 시 정확한 flush 보장.
         // </details>
         page.pin()
         pages[id] = page
@@ -135,20 +83,19 @@ class BufferPool(
 
     fun unpinPage(id: PageId, isDirty: Boolean) {
         val page = pages[id] ?: throw StorageError.PageNotInPool(id)
-        // Q: unpin 시 isDirty=true로 받은 적이 한 번이라도 있으면 page는 dirty인가?
+        // Q: isDirty=true 한 번이라도 받으면 page는 dirty?
         if (isDirty) page.markDirty()
         page.unpin()
         // <details><summary>A</summary>
-        //
-        // 한 번이라도 dirty=true 신호 받으면 page 전체가 dirty (markClean은 flush 후에만). cumulative dirty 누적.
+        // cumulative dirty — markClean은 flush 후에만 호출. 한 번 dirty면 evict 전까지 dirty.
         // </details>
     }
 
     fun flushPage(id: PageId) {
-        val page = pages[id] ?: return
+        val page = pages[id] ?: return                                // 없으면 no-op
         if (page.isDirty) {
-            pagedFile.writePage(page)
-            page.markClean()
+            pagedFile.writePage(page)                                 // disk에 쓰기
+            page.markClean()                                          // 이제 깨끗
         }
     }
 
@@ -159,63 +106,49 @@ class BufferPool(
                 page.markClean()
             }
         }
-        // Q: flushAll 끝에 pagedFile.sync()를 호출하는 이유?
+        // Q: flushAll 끝에 sync 호출 이유?
         pagedFile.sync()
         // <details><summary>A</summary>
-        //
-        // write만으로는 OS buffer까지, sync()가 디스크까지 — durability invariant CI-2 만족.
+        // write는 OS buffer까지, sync가 disk까지 — durability invariant CI-2 만족.
         // </details>
     }
 
     fun cachedPageCount(): Int = pages.size
 
     private fun evictOne() {
-        // Q: 왜 firstOrNull { pinCount == 0 } ? iteration 순서가 무엇을 보장하는가?
+        // Q: firstOrNull { pinCount == 0 } — iteration 순서가 무엇 보장?
         val victim = pages.values.firstOrNull { it.pinCount == 0 }
             ?: throw StorageError.AllPagesPinned(capacity)
         // <details><summary>A</summary>
-        //
-        // access-order LinkedHashMap의 iteration은 LRU 순 — 첫 unpinned가 가장 오래 안 쓴 page (LRU victim).
+        // access-order LinkedHashMap iteration = LRU 순. 첫 unpinned = 가장 오래 안 쓴 page (LRU victim).
         // </details>
         if (victim.isDirty) {
-            pagedFile.writePage(victim)
+            pagedFile.writePage(victim)                              // dirty면 disk 쓰기 (sync 안 함 — flushAll에서)
             victim.markClean()
         }
-        pages.remove(victim.id)
+        pages.remove(victim.id)                                      // 캐시에서 제거
     }
 
     override fun close() {
-        flushAll()
+        flushAll()                                                    // close 시 자동 flush
     }
 
     companion object {
-        const val DEFAULT_CAPACITY: Int = 256
+        const val DEFAULT_CAPACITY: Int = 256                        // 256 page = 1MB (4KB × 256)
     }
 }
 ```
 
----
+## 5. 검증 (4 PASSED)
+- newPage 후 fetch → 같은 객체
+- LRU eviction — capacity=2에 3 page 넣으면 첫째 evict + flush
+- 모두 pinned 상태에서 newPage → AllPagesPinned throw
+- flushPage 후 reopen → 데이터 보존
 
-## 6. 검증 테스트
+## 6. 깨뜨릴 과제
+- capacity=1 — 어떤 사용 패턴에서 무한 IO?
+- unpin 안 하고 fetch 반복 → 어떤 에러?
+- dirty page evict 안 하고 process kill → 데이터 손실 분석.
 
-(`src/test/kotlin/com/dbenginelab/storage/BufferPoolTest.kt` 4 PASSED)
-
----
-
-## 7. 직접 깨뜨릴 과제
-
-- 과제 1: capacity를 1로 줄이면 어떤 사용 패턴에서 무한 IO 발생? hit ratio 측정 방법은?
-- 과제 2: unpin 안 하고 fetch만 계속하면 어떤 에러? 학습 코드에서 typical bug 패턴은?
-- 과제 3: dirty page를 evict 안 하고 process kill하면 어떤 데이터 손실? `flushAll`을 어디서 부르는 게 안전한가?
-
----
-
-## 8. 다음 한계
-
-- BufferPool은 IO 최적화지만 search는 여전히 풀스캔. → **단계 3 BTreeIndex**.
-
----
-
-| 날짜 | 변경 |
-|------|------|
-| 2026-05-16 | 초안 — 검증 완료 |
+## 7. 다음 한계
+- search 여전히 풀스캔 → **단계 3 BTreeIndex**.

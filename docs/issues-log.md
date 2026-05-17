@@ -5,6 +5,42 @@
 
 ---
 
+## ISSUE-004 (보강 Stage 8 X2): Recovery `when` exhaustive 미충족
+
+**증상**: `'when' expression must be exhaustive. Add the 'is Checkpoint' branch or an 'else' branch.`
+
+**원인**: LogRecord에 `Checkpoint` 새 케이스 추가 → 기존 `Recovery.recover()`의 `when` 분기가 비exhaustive.
+
+**해결**: `is LogRecord.Checkpoint -> { /* legacy Recovery ignores */ }` 분기 추가. 새 IdempotentRecovery만 Checkpoint 사용.
+
+**학습**: sealed class에 케이스 추가 시 모든 호출자 컴파일러가 잡아줌 — 안전한 변경.
+
+---
+
+## ISSUE-003 (보강 Stage 11): InsertOp import path 오류
+
+**증상**: `Unresolved reference 'InsertOp'`. OptimizerTest 3 곳.
+
+**원인**: `InsertOp`은 `com.dbenginelab.executor` 패키지에 있는데 테스트 코드가 `com.dbenginelab.table.InsertOp`로 import.
+
+**해결**: import path 수정.
+
+**학습**: 같은 도메인 클래스가 여러 패키지에 분산 시 import 오류 빈번. IDE 자동완성 의존 위험.
+
+---
+
+## ISSUE-002 (Stage 6-2): Kotlin backtick 함수명에 콜론 사용 불가
+
+**증상**: `Name contains illegal characters: :.`
+
+**원인**: Kotlin backtick identifier에 `:` illegal.
+
+**해결**: `Filter: age...` → `Filter age...`로 변경.
+
+**학습**: Kotlin backtick은 `:`, `;`, `.`, `,`, `[`, `]`, `<`, `>`, `(`, `)`, `{`, `}`, `/` 등 illegal. 한국어/공백은 OK.
+
+---
+
 ## ISSUE-001 (Stage 3-2): B+tree separator navigation 분기 순서 버그
 
 **발생 단계**: 3-2 (BTree leaf split)

@@ -1,80 +1,236 @@
-# impl/04-01 — Schema, Type, Catalog, Tuple
+# impl/04-01 — Type / Schema / Catalog / Tuple (한 줄 한 줄)
 
-> 상위: `docs/stages/04-schema-catalog.md`
-> 범위: Type enum, ColumnDef, TableSchema, Tuple (직렬화), Catalog (persistence).
-> **✅ 검증 완료. 누적 28 tests PASSED.**
+> **검증**: CatalogTest 8 PASSED.
+> 작성 파일:
+> - 신규 디렉토리: `src/main/kotlin/com/dbenginelab/catalog/`
+> - 신규: Type.kt, ColumnDef.kt, TableSchema.kt, Tuple.kt, Catalog.kt
+> - 신규 테스트: `src/test/kotlin/com/dbenginelab/catalog/CatalogTest.kt`
 
----
-
-## 0. 참조 출처
+## 0. 참조
 - SimpleDB `Catalog`, `TupleDesc`, `Tuple`, `Type`.
 - BusTub `catalog`, `column`, `schema`.
 
 ## 1. invariant
-- **CI-1**: Tuple encode → decode 라운드트립 동일.
-- **CI-2**: NOT NULL 컬럼에 null 거부.
-- **CI-3**: 타입 불일치 거부.
-- **CI-4**: Catalog persist 후 reopen 시 schema 복원.
-- **CI-5**: 중복 컬럼명, 중복 테이블명 거부.
+- Type encode → decode round-trip.
+- Tuple encode → decode (with NULL) round-trip.
+- NOT NULL 컬럼에 null insert 거부.
+- 타입 불일치 거부.
+- Catalog persist → reopen → schema 복원.
 
-## 2. 핵심 결정
-- **Type은 enum + per-type handler** — sealed로 닫지 않음 (codex 보정 2: storage/type 확장 지점). 단계 5에서 DECIMAL/DATE 추가 시 enum + when.
-- **ColumnDef/TableSchema는 data class** — 도메인 메타데이터, value equality OK.
-- **Tuple은 일반 class** — values는 List<Any?>, equals/hashCode 명시.
-- **NULL bitmap** — `(N+7)/8 bytes`, 비트 단위 표시.
-- **Catalog persistence** — 단순 binary format. 매번 전체 재기록 (단일 thread 가정, 단계 13 이전).
-
-## 3. Tuple encoding 형식
-```
-[null bitmap (ceil(N/8) bytes)]
-[encoded non-null values in column order]
-```
-- INT: 4 bytes
-- BIGINT: 8 bytes
-- STRING: 4 bytes length-prefix + UTF-8 bytes
-
-## 4. Catalog encoding 형식
-table 별로:
-```
-[4: name length][name bytes]
-[4: column count]
-repeat column count:
-  [4: col name length][col name bytes]
-  [1: type ordinal]
-  [1: nullable flag]
-```
-
-## 5. Q/A 핵심 줄
+## 2. Type.kt — 한 줄 한 줄
 
 ```kotlin
-// Q: 왜 data class가 ColumnDef에는 OK인데 Page에는 금지였나?
-data class ColumnDef(val name: String, val type: Type, val nullable: Boolean = true)
-```
-<details><summary>A</summary>
+package com.dbenginelab.catalog                                      // 신규 catalog 패키지
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
 
-ColumnDef는 immutable 값 객체 (메타데이터). Page는 mutable byte 컨테이너 — 자동 equals/hashCode가 의미 없거나 거짓 안전감.
-</details>
+// Q: 왜 enum이 sealed보다 적절?
+enum class Type {
+    // <details><summary>A</summary>
+    // 타입 확장 가능 (DECIMAL, DATE, TIMESTAMP...) — sealed의 "닫힌" 의미와 다름. enum + when handler가 자연.
+    // </details>
+    INT, BIGINT, STRING;
 
-```kotlin
-// Q: requireTypeMatches에서 String, Int, Long을 직접 체크 — 더 우아한 방법?
-when (col.type) {
-    Type.INT -> v is Int
-    Type.BIGINT -> v is Long
-    Type.STRING -> v is String
+    fun encode(value: Any?, buffer: ByteBuffer) {                    // 값 → bytes
+        when (this) {
+            INT -> buffer.putInt(value as Int)                       // 4 bytes
+            BIGINT -> buffer.putLong(value as Long)                  // 8 bytes
+            STRING -> {
+                val bytes = (value as String).toByteArray(StandardCharsets.UTF_8)
+                buffer.putInt(bytes.size)                            // length-prefix
+                buffer.put(bytes)
+            }
+        }
+    }
+
+    fun decode(buffer: ByteBuffer): Any = when (this) {              // bytes → 값
+        INT -> buffer.int
+        BIGINT -> buffer.long
+        STRING -> {
+            val len = buffer.int
+            val bytes = ByteArray(len); buffer.get(bytes)
+            String(bytes, StandardCharsets.UTF_8)
+        }
+    }
+
+    fun fixedSize(): Int = when (this) {                             // -1 = variable
+        INT -> 4; BIGINT -> 8; STRING -> -1
+    }
 }
 ```
-<details><summary>A</summary>
 
-Kotlin reflection은 더 우아하지만 runtime cost. enum + when이 명시적 + 빠름 + Type 추가 시 컴파일러가 missing branch 경고.
-</details>
+## 3. ColumnDef.kt — 한 줄 한 줄
 
-## 6. 직접 깨뜨릴 과제
-- 과제 1: STRING 컬럼에 1MB string 넣으면 어떤 일? Tuple.encode의 buffer estimation 부정확하면?
-- 과제 2: Catalog 저장 도중 process kill → reopen 시 partial 파일 어떻게 처리?
-- 과제 3: Type에 DECIMAL 추가하려면 어디까지 바꿔야 하나? (encode, decode, requireTypeMatches, fixedSize)
+```kotlin
+package com.dbenginelab.catalog
 
-## 7. 다음 한계
-- Schema만으론 PK/FK/UNIQUE/CHECK 검증 불가 → **단계 5 Constraints**.
+// Q: data class OK?
+data class ColumnDef(
+    val name: String,
+    val type: Type,
+    val nullable: Boolean = true,
+)
+// <details><summary>A</summary>
+// immutable 값 객체 — 자동 equals/hashCode 의미 맞음. Page와 달리 mutable byte 아님.
+// </details>
+```
 
----
-| 2026-05-16 | 초안 |
+## 4. TableSchema.kt — 한 줄 한 줄
+
+```kotlin
+package com.dbenginelab.catalog
+
+data class TableSchema(
+    val name: String,
+    val columns: List<ColumnDef>,
+    val constraints: List<Constraint> = emptyList(),                  // 단계 5에서 추가
+) {
+    init {
+        require(columns.isNotEmpty()) { "table $name must have at least one column" }
+        // Q: 중복 컬럼명 검사 — toSet().size 비교가 왜 동작?
+        require(columns.map { it.name }.toSet().size == columns.size) {
+            "duplicate column names in table $name"
+        }
+        // <details><summary>A</summary>
+        // toSet은 중복 제거 — 원본 size와 다르면 중복 있음. O(N) 검사.
+        // </details>
+        validateConstraints()
+    }
+
+    val columnCount: Int get() = columns.size
+
+    fun columnIndex(name: String): Int {
+        val idx = columns.indexOfFirst { it.name == name }
+        require(idx >= 0) { "column $name not found in table ${this.name}" }
+        return idx
+    }
+
+    fun column(name: String): ColumnDef = columns[columnIndex(name)]
+
+    fun primaryKey(): Constraint.PrimaryKey? =
+        constraints.filterIsInstance<Constraint.PrimaryKey>().firstOrNull()
+
+    private fun validateConstraints() { /* 단계 5 참조 */ }
+}
+```
+
+## 5. Tuple.kt — 한 줄 한 줄
+
+```kotlin
+package com.dbenginelab.catalog
+import java.nio.ByteBuffer
+
+class Tuple(val schema: TableSchema, val values: List<Any?>) {
+
+    init {
+        require(values.size == schema.columnCount)
+        for ((i, col) in schema.columns.withIndex()) {
+            val v = values[i]
+            if (v == null) require(col.nullable) { "column ${col.name} NOT NULL but null" }
+            else requireTypeMatches(col, v)
+        }
+    }
+
+    fun get(columnName: String): Any? = values[schema.columnIndex(columnName)]
+
+    fun encode(): ByteArray {                                         // tuple → bytes
+        val n = schema.columnCount
+        val bitmapSize = (n + 7) / 8                                 // Q: NULL bitmap size 계산?
+        // <details><summary>A</summary>
+        // ceil(N/8) bytes — 각 bit가 한 컬럼의 NULL 여부.
+        // </details>
+        val estimated = bitmapSize + values.sumOf { v ->
+            if (v == null) 0
+            else when (v) {
+                is Int -> 4; is Long -> 8
+                is String -> 4 + v.toByteArray(Charsets.UTF_8).size
+                else -> error("unsupported runtime type: ${v::class.simpleName}")
+            }
+        }
+        val buf = ByteBuffer.allocate(estimated)
+        val bitmap = ByteArray(bitmapSize)
+        for ((i, v) in values.withIndex()) {
+            // Q: NULL이면 bit set — 어떤 비트?
+            if (v == null) bitmap[i / 8] = (bitmap[i / 8].toInt() or (1 shl (i % 8))).toByte()
+            // <details><summary>A</summary>
+            // i/8 = byte 위치, i%8 = bit 위치. 1 << (i%8) = 해당 bit만 1. or로 set.
+            // </details>
+        }
+        buf.put(bitmap)                                              // bitmap 먼저
+        for ((i, v) in values.withIndex()) {                         // 그 다음 non-null 값들
+            if (v != null) schema.columns[i].type.encode(v, buf)
+        }
+        return buf.array().copyOf(buf.position())                    // 실제 쓴 만큼만
+    }
+
+    companion object {
+        fun decode(schema: TableSchema, bytes: ByteArray): Tuple {
+            val n = schema.columnCount
+            val bitmapSize = (n + 7) / 8
+            val buf = ByteBuffer.wrap(bytes)
+            val bitmap = ByteArray(bitmapSize); buf.get(bitmap)
+            val values = mutableListOf<Any?>()
+            for (i in 0 until n) {
+                val isNull = (bitmap[i / 8].toInt() shr (i % 8)) and 1 == 1
+                if (isNull) values.add(null)
+                else values.add(schema.columns[i].type.decode(buf))
+            }
+            return Tuple(schema, values)
+        }
+
+        private fun requireTypeMatches(col: ColumnDef, v: Any) {
+            val ok = when (col.type) {
+                Type.INT -> v is Int
+                Type.BIGINT -> v is Long
+                Type.STRING -> v is String
+            }
+            require(ok) { "column ${col.name} expects ${col.type} but got ${v::class.simpleName}" }
+        }
+    }
+}
+```
+
+## 6. Catalog.kt — persistence (요약 + Q/A)
+
+```kotlin
+package com.dbenginelab.catalog
+import java.io.*
+
+class Catalog(private val metaPath: String) {
+    private val tables: MutableMap<String, TableSchema> = mutableMapOf()
+    init { load() }                                                  // reopen 시 자동 복원
+
+    fun registerTable(schema: TableSchema) {
+        require(!tables.containsKey(schema.name))                    // 중복 거부
+        tables[schema.name] = schema
+        save()                                                       // Q: 매번 전체 재기록?
+    }
+    // <details><summary>A</summary>
+    // 단순화 — 단일 thread 가정. 매번 전체 rewrite. multi-table 많으면 incremental 필요.
+    // </details>
+
+    fun dropTable(name: String) {
+        require(tables.containsKey(name))
+        tables.remove(name); save()
+    }
+
+    fun getTable(name: String): TableSchema = tables[name] ?: throw NoSuchElementException("table $name not found")
+    fun listTables(): List<String> = tables.keys.sorted()
+
+    private fun load() { /* binary read — TableSchema sequence */ }
+    private fun save() { /* binary write */ }
+}
+```
+
+## 7. 검증 (8 PASSED)
+- Type encode·decode (INT, BIGINT, STRING)
+- 중복 컬럼명 거부
+- Tuple round-trip with NULL
+- NOT NULL에 null 거부
+- 타입 불일치 거부
+- Catalog persist + reopen
+- 중복 테이블 거부
+- dropTable persist
+
+## 8. 다음 한계
+- Schema만으론 무결성 부족 → **단계 5 Constraints**.
