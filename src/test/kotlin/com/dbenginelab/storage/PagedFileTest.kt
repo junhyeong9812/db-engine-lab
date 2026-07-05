@@ -12,7 +12,7 @@ class PagedFileTest {
     @Test
     fun `allocatePage 후 readPage하면 zero-filled page`(@TempDir tempDir: Path) {
         val path = tempDir.resolve("paged.db").toString()
-        PagedFile(path).use { pf ->
+        PagedFile(path).use {pf ->
             val pid = pf.allocatePage()
             assertEquals(0, pid.pageNumber)
             val page = pf.readPage(pid)
@@ -39,7 +39,7 @@ class PagedFileTest {
     }
 
     @Test
-    fun `존재하지 않는 page 읽으면 PageNotFound`(@TempDir tempDir: Path) {
+    fun `존재하지 않는 page 읽으면 PageNotFound` (@TempDir tempDir: Path) {
         val path = tempDir.resolve("paged.db").toString()
         PagedFile(path).use { pf ->
             assertFailsWith<StorageError.PageNotFound> {
