@@ -13,7 +13,7 @@ class BufferPoolTest {
     fun `newPage 후 같은 id로 fetch하면 같은 페이지`(@TempDir tempDir: Path) {
         val path = tempDir.resolve("bp.db").toString()
         PagedFile(path).use { pf ->
-            BufferPool(pf, capacity = 4).use { bp ->
+            BufferPool(pf, capacity = 4).use {bp ->
                 val p1 = bp.newPage()
                 p1.write(0, "x".toByteArray())
                 bp.unpinPage(p1.id, isDirty = true)
@@ -42,14 +42,17 @@ class BufferPoolTest {
                 c.write(0, "C".toByteArray())
                 bp.unpinPage(c.id, isDirty = true)
 
+                // 해당 위치에서 C가 들어오면서 capacity 초과가 발생하며 LRU eviction(Least Recently Used eviction)으로
+                // 캐시가 꽉 찼을 때, "가장 오랫동안 사용되지 않은" 항목을 내쫒고 그 자리에 새 항목을 넣는 캐시 교환 정책이 발생하여,
+                // "A"에 대해서 dirty 상태라 자동으로 디스크에 flush된다. 이를 기반으로 아래와 같이 expected가 2인지 확인한다.
                 assertEquals(2, bp.cachedPageCount())
 
                 bp.flushAll()
             }
             PagedFile(path).use { pf2 ->
-                val a2 = pf2.readPage(PageId(0, 0))
-                assertContentEquals("A".toByteArray(), a2.read(0, 1))
-                val c2 = pf2.readPage(PageId(0, 2))
+                val a2 = pf2.readPage(PageId(0,0))
+                assertContentEquals("A".toByteArray(), a2.read(0,1))
+                val c2 = pf2.readPage(PageId(0,2))
                 assertContentEquals("C".toByteArray(), c2.read(0, 1))
             }
         }
@@ -72,9 +75,9 @@ class BufferPoolTest {
     @Test
     fun `flushPage 후 reopen해서 같은 데이터 확인`(@TempDir tempDir: Path) {
         val path = tempDir.resolve("bp.db").toString()
-        val pid: PageId
+        val pid : PageId
         PagedFile(path).use { pf ->
-            BufferPool(pf, capacity = 4).use { bp ->
+            BufferPool(pf, capacity = 4).use {bp ->
                 val p = bp.newPage()
                 pid = p.id
                 p.write(0, "persist".toByteArray())
