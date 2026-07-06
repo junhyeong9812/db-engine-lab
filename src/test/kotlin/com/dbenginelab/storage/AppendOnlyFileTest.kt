@@ -29,6 +29,4 @@ class AppendOnlyFileTest {
         }
 
     }
-
-    private class Record(val key: ByteArray, val value: ByteArray)
 }
