@@ -37,6 +37,29 @@ class BTreeIndex(
         finally { bufferPool.unpinPage(page.id, isDirty = true)}
     }
 
+    fun rangeScan(fromInclusive: Long, toExclusive: Long): List<Pair<Long, Long>> {
+        require(fromInclusive <= toExclusive) {"fromInclusive ($fromInclusive) > toExclusive ($toExclusive)"}
+        val result = mutableListOf<Pair<Long, Long>>()
+        var leafPageNo = findLeafPage(fromInclusive)
+        while (leafPageNo != BTreePage.INVALID) {
+            val page = bufferPool.fetchPage(PageId(pagedFile.fileId, leafPageNo))
+            try {
+                val btp = BTreePage(page)
+                val startSlot = btp.findSlot(fromInclusive)
+                for (index in startSlot until btp.keyCount) {
+                    val key = btp.keyAt(index)
+                    if (key >= toExclusive) return result
+                    result.add(key to btp.valueAt(index))
+                }
+                leafPageNo = btp.auxPage
+            } finally {
+                bufferPool.unpinPage(page.id, isDirty = false)
+            }
+            return result
+        }
+
+    }
+
     private fun findLeafPage(key: Long): Int {                           // root → leaf 따라감
         var pageNo = ROOT_PAGE_NUMBER
         while (true) {
