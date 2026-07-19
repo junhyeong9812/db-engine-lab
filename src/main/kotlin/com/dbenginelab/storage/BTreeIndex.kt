@@ -55,9 +55,8 @@ class BTreeIndex(
             } finally {
                 bufferPool.unpinPage(page.id, isDirty = false)
             }
-            return result
         }
-
+        return result
     }
 
     private fun findLeafPage(key: Long): Int {                           // root → leaf 따라감
