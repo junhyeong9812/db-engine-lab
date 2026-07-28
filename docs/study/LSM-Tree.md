@@ -55,3 +55,40 @@ Bloom Filter -------> "이 SSTable에 key 42가 확실히 없다"를 메모리�
 Sparse Index  -------> SSTable 안의 위치를 대략 찾아주는 색인
 SSTable 내부 정렬 -------> 정렬돼 있으니 이진 탐색 가능. 범위 스캔도 순차 읽기
 
+Compaction - LSM의 GC
+SSTable이 계속 쌓이면 읽기가 느려지고 공간도 낭비된다. 그래서 여러 SSTable을 병합 정렬해서 하나로 합치는 작업을 백그라운드로 돌린다.
+```text
+SSTable-1: (1,A) (5,X) (9,C)
+SSTable-2: (5,Y) (7,D)              ← 5가 중복, 2가 최신
+                ↓ compaction
+새 SSTable: (1,A) (5,Y) (7,D) (9,C)  ← 옛날 5는 버림, tombstone도 여기서 실제 삭제
+```
+이미 정렬된 파일들을 순차로 읽어 순차로 쓰는 작업이라 compaction도 순차I/O이다.
+
+전략에 따른 트레이드오프
+전략 ---> 특징
+Leveled ---> 레벨별로 크기를 10배씩 키우며 계층 관리, 읽기 빠름.공간 효율 좋음 쓰기 증폭 큼
+Size-tiered ---> 비슷한 크기끼리 합침. 쓰기 증폭 적음, 읽기 느림,공간 낭비
+
+## RUM Conjecture
+LSM을 이해하는 가장 좋은 틀이다. Read/Update/Memory(공간) 중 둘을 좋게하면 하나는 나빠진다는 것.
+                B-Tree          LSM-Tree
+쓰기             랜덤, 느림        순차,빠름
+읽기(단건)        빠름(경로 하나)    여러 곳 확인 필요
+공간             페이지 단편화      압축 잘 된다.
+배경 작업         적음             compaction 부담
+
+위와 같은 특성을 가지며, 쓰기가 많으면 LSM, 읽기 중심이면 B-Tree가 일반적인 선택이다.
+RocksDB, Cassandra,HBase,LevelDB,ScyllaDB, InfluxDB 등이 LSM 계열이다.
+
+### Kafka와 LSM-Tree의 관계
+서로 목적이 다르다.
+```text
+Kafka:  key로 조회할 일이 없음 → offset으로 위치만 알면 됨
+        → 정렬도, compaction도, Bloom filter도 필요 없음
+        → 그냥 순수한 append-only 로그
+
+LSM:    key로 조회해야 함 → 정렬 필요 → 그래서 compaction이라는 대가를 지불
+```
+Kafka는 LSM에서 "쓰기는 순차로"라는 부분만 취하고, key 조회라는 요구사항이 없어서 나머지 복잡도를 전부 생략한 형태이다.
+Kafka의 log compaction은 이름은 비슷하지만 "key별 최신 값만 남기는"별개 기능이다.
