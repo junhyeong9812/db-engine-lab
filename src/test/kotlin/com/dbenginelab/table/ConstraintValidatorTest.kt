@@ -13,7 +13,6 @@ import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Path
 
 class ConstraintValidatorTest {
-
     private fun userSchema() = TableSchema(
         name = "users",
         columns = listOf(
@@ -45,7 +44,7 @@ class ConstraintValidatorTest {
     fun `중복 Unique 거부`(@TempDir tempDir: Path) {
         val path = tempDir.resolve("u.data").toString()
         val schema = userSchema()
-        PagedFile(path).use { pf -> BufferPool(pf, 16).use { bp ->
+        PagedFile(path).use {pf -> BufferPool(pf, 16).use { bp ->
             val heap = TableHeap(schema, pf, bp)
             val v = ConstraintValidator(heap)
             val t1 = Tuple(schema, listOf(1L, "a@x.com"))
