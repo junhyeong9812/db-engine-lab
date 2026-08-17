@@ -252,6 +252,15 @@ import java.nio.charset.StandardCharsets
  */
 class LogManager(path: String) : Closeable {
 
+    companion object {
+        // wire format 크기 — LogManager가 소유한 직렬화 세부. allocate 합산식과 put 호출의 대응을 이름으로 고정한다.
+        private const val TAG_BYTES = 1         // record tag (Byte)
+        private const val TX_ID_BYTES = 8       // txId (Long)
+        private const val LSN_BYTES = 8         // checkpointLsn (Long)
+        private const val LEN_PREFIX_BYTES = 4  // 길이·개수 접두 (Int)
+        private const val HEADER_BYTES = TAG_BYTES + TX_ID_BYTES  // 모든 레코드 공통 머리: [tag][txId]
+    }
+
     private val file = RandomAccessFile(path, "rw")
     @Volatile private var nextLsn: Long = 1
 
@@ -313,23 +322,25 @@ class LogManager(path: String) : Closeable {
     private fun encode(record: LogRecord): ByteArray {
         return when (record) {
             is LogRecord.BeginTx -> {
-                val buf = ByteBuffer.allocate(1 + 8)
+                val buf = ByteBuffer.allocate(HEADER_BYTES)
                 buf.put(LogRecord.TAG_BEGIN); buf.putLong(record.txId)
                 buf.array()
             }
             is LogRecord.CommitTx -> {
-                val buf = ByteBuffer.allocate(1 + 8)
+                val buf = ByteBuffer.allocate(HEADER_BYTES)
                 buf.put(LogRecord.TAG_COMMIT); buf.putLong(record.txId)
                 buf.array()
             }
             is LogRecord.AbortTx -> {
-                val buf = ByteBuffer.allocate(1 + 8)
+                val buf = ByteBuffer.allocate(HEADER_BYTES)
                 buf.put(LogRecord.TAG_ABORT); buf.putLong(record.txId)
                 buf.array()
             }
             is LogRecord.InsertRow -> {
                 val name = record.tableName.toByteArray(StandardCharsets.UTF_8)
-                val buf = ByteBuffer.allocate(1 + 8 + 4 + name.size + 4 + record.tupleBytes.size)
+                val buf = ByteBuffer.allocate(
+                    HEADER_BYTES + LEN_PREFIX_BYTES + name.size + LEN_PREFIX_BYTES + record.tupleBytes.size
+                )
                 buf.put(LogRecord.TAG_INSERT)
                 buf.putLong(record.txId)
                 buf.putInt(name.size); buf.put(name)
@@ -337,10 +348,10 @@ class LogManager(path: String) : Closeable {
                 buf.array()
             }
             is LogRecord.Checkpoint -> {
-                val activeTxsBuf = ByteBuffer.allocate(4 + record.activeTxs.size * 8)
+                val activeTxsBuf = ByteBuffer.allocate(LEN_PREFIX_BYTES + record.activeTxs.size * TX_ID_BYTES)
                 activeTxsBuf.putInt(record.activeTxs.size)
                 for (tx in record.activeTxs) activeTxsBuf.putLong(tx)
-                val buf = ByteBuffer.allocate(1 + 8 + 8 + activeTxsBuf.position())
+                val buf = ByteBuffer.allocate(HEADER_BYTES + LSN_BYTES + activeTxsBuf.position())
                 buf.put(LogRecord.TAG_CHECKPOINT)
                 buf.putLong(0L)  // txId placeholder
                 buf.putLong(record.checkpointLsn)
