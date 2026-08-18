@@ -1,0 +1,137 @@
+package com.dbenginelab.wal
+
+import java.io.Closeable
+import java.io.EOFException
+import java.io.RandomAccessFile
+import java.nio.ByteBuffer
+import java.nio.charset.StandardCharsets
+
+class LogManager(path: String): Closeable {
+    private val file = RandomAccessFile(path, "rw")
+    @Volatile private var nextLsn: Long = 1
+
+    init {
+        file.seek(0)
+        var count = 0L
+        while (file.filePointer < file.length()) {
+            try {
+                val len = file.readInt()
+                file.skipBytes(len)
+                count++
+            } catch (_: EOFException) { break }
+        }
+    }
+
+    fun append(record: LogRecord): Long {
+        val payload = encode(record)
+        file.seek(file.length())
+        file.writeInt(payload.size)
+        file.write(payload)
+        val lsn = nextLsn
+        nextLsn++
+        return lsn
+    }
+
+    fun sync() { file.fd.sync() }
+
+    fun currentLsn(): Long = nextLsn - 1
+
+    fun replay(handler: (LogRecord) -> Unit) {
+        replayWithLsn {_, rec -> handler(rec)}
+    }
+
+    fun replayWithLsn(handler: (Long, LogRecord) -> Unit) {
+        file.seek(0)
+        var lsn = 0L
+        while (file.filePointer < file.length()) {
+            try {
+                val len = file.readInt()
+                val bytes = ByteArray(len)
+                file.readFully(bytes)
+                lsn++
+                handler(lsn, decode(bytes))
+            } catch (_: EOFException) {
+                break
+            }
+        }
+        file.seek(file.length())
+    }
+
+    override fun close() { file.close() }
+
+    private fun encode(record: LogRecord): ByteArray {
+        return when (record) {
+            is LogRecord.BeginTx -> {
+                val buf = ByteBuffer.allocate(HEADER_BYTES)
+                buf.put(LogRecord.TAG_BEGIN); buf.putLong(record.txId)
+                buf.array()
+            }
+            is LogRecord.CommitTx -> {
+                val buf = ByteBuffer.allocate(HEADER_BYTES)
+                buf.put(LogRecord.TAG_COMMIT); buf.putLong(record.txId)
+                buf.array()
+            }
+            is LogRecord.AbortTx -> {
+                val buf = ByteBuffer.allocate(HEADER_BYTES)
+                buf.put(LogRecord.TAG_ABORT); buf.putLong(record.txId)
+                buf.array()
+            }
+            is LogRecord.InsertRow -> {
+                val name = record.tableName.toByteArray(StandardCharsets.UTF_8)
+                val buf = ByteBuffer.allocate(
+                    HEADER_BYTES + LEN_PREFIX_BYTES + name.size + LEN_PREFIX_BYTES + record.tupleBytes.size
+                )
+                buf.put(LogRecord.TAG_INSERT)
+                buf.putLong(record.txId)
+                buf.putInt(name.size); buf.put(name)
+                buf.putInt(record.tupleBytes.size); buf.put(record.tupleBytes)
+                buf.array()
+            }
+            is LogRecord.Checkpoint -> {
+                val activeTxsBuf = ByteBuffer.allocate(LEN_PREFIX_BYTES + record.activeTxs.size * TX_ID_BYTES)
+                activeTxsBuf.putInt(record.activeTxs.size)
+                for (tx in record.activeTxs) activeTxsBuf.putLong(tx)
+                val buf = ByteBuffer.allocate(HEADER_BYTES + LSN_BYTES + activeTxsBuf.position())
+                buf.put(LogRecord.TAG_CHECKPOINT)
+                buf.putLong(0L)  // txId placeholder
+                buf.putLong(record.checkpointLsn)
+                buf.put(activeTxsBuf.array(), 0, activeTxsBuf.position())
+                buf.array()
+            }
+        }
+    }
+
+    private fun decode(bytes: ByteArray): LogRecord {
+        val buf = ByteBuffer.wrap(bytes)
+        val tag = buf.get()
+        val txId = buf.long
+        return when (tag) {
+            LogRecord.TAG_BEGIN -> LogRecord.BeginTx(txId)
+            LogRecord.TAG_COMMIT -> LogRecord.CommitTx(txId)
+            LogRecord.TAG_ABORT -> LogRecord.AbortTx(txId)
+            LogRecord.TAG_INSERT -> {
+                val nameLen = buf.int
+                val nameBytes = ByteArray(nameLen); buf.get(nameBytes)
+                val tupleLen = buf.int
+                val tupleBytes = ByteArray(tupleLen); buf.get(tupleBytes)
+                LogRecord.InsertRow(txId, String(nameBytes, StandardCharsets.UTF_8), tupleBytes)
+            }
+            LogRecord.TAG_CHECKPOINT -> {
+                val ckLsn = buf.long
+                val count = buf.int
+                val active = LongArray(count) { buf.long }.toList()
+                LogRecord.Checkpoint(ckLsn, active)
+            }
+            else -> error("unknown log tag: $tag")
+        }
+    }
+
+    companion object {
+        // wire format 크기 — LogManager가 소유한 직렬화 세부. allocate 합산식과 put 호출의 대응을 이름으로 고정한다.
+        private const val TAG_BYTES = 1         // record tag (Byte)
+        private const val TX_ID_BYTES = 8       // txId (Long)
+        private const val LSN_BYTES = 8         // checkpointLsn (Long)
+        private const val LEN_PREFIX_BYTES = 4  // 길이·개수 접두 (Int)
+        private const val HEADER_BYTES = TAG_BYTES + TX_ID_BYTES  // 모든 레코드 공통 머리: [tag][txId]
+    }
+}
