@@ -9,6 +9,7 @@ import java.nio.charset.StandardCharsets
 class LogManager(path: String): Closeable {
     private val file = RandomAccessFile(path, "rw")
     @Volatile private var nextLsn: Long = 1
+    @Volatile private var maxTxIdSeen: Long = 0
 
     init {
         file.seek(0)
@@ -16,10 +17,15 @@ class LogManager(path: String): Closeable {
         while (file.filePointer < file.length()) {
             try {
                 val len = file.readInt()
-                file.skipBytes(len)
+                file.readByte()                       // tag — 값은 필요 없다
+                val txId = file.readLong()            // 헤더의 txId
+                if (txId > maxTxIdSeen) maxTxIdSeen = txId
+                file.skipBytes(len - HEADER_BYTES)    // 나머지 본문만 건너뛴다
                 count++
             } catch (_: EOFException) { break }
         }
+        nextLsn = count + 1
+        file.seek(file.length())
     }
 
     fun append(record: LogRecord): Long {
@@ -56,6 +62,9 @@ class LogManager(path: String): Closeable {
         }
         file.seek(file.length())
     }
+
+    /** 스캔 시점까지 로그에 존재한 최대 txId. 로그가 비어 있으면 0. */
+    fun maxTxId(): Long = maxTxIdSeen
 
     override fun close() { file.close() }
 
