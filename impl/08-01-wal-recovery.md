@@ -8,7 +8,7 @@
 > - 신규 패키지: `src/main/kotlin/com/dbenginelab/wal/`
 > - 신규: `LogRecord.kt` · `LogManager.kt` · `Transaction.kt` · `Recovery.kt`
 > - 신규 테스트: `src/test/kotlin/com/dbenginelab/wal/WalRecoveryTest.kt`
-> **검증**: `WalRecoveryTest` 5 PASSED
+> **검증**: `WalRecoveryTest` 5 PASSED (§5.5 txId 복원까지 반영하면 6 PASSED)
 > **예상 타이핑 시간**: 80분 (단계 8은 가장 큰 단계 — 나눠 쳐도 된다)
 
 ---
@@ -23,6 +23,7 @@
 - **CI-1 (Atomicity)**: commit/abort가 all-or-nothing이다.
 - **CI-2 (Durability)**: commit 직후 crash가 나도 recovery가 복원한다.
 - **CI-3 (WAL rule)**: 데이터를 바꾸기 **전에** 로그가 먼저 디스크에 있어야 한다.
+- **CI-4 (txId 유일성)**: txId는 **로그 파일의 수명 전체**에서 유일해야 한다 — 프로세스 재시작을 넘어서도. Recovery가 committed/aborted를 txId 기준으로 판정하므로, 이것이 깨지면 CI-1이 조용히 깨진다. (§5.1~5.4의 초기 구현은 이를 보장하지 않는다 — §5.5에서 고친다.)
 
 ## 2. 단순화 — deferred-apply + redo-only
 
@@ -497,6 +498,127 @@ class Recovery(
 }
 ```
 
+### 5.5 txId 재시작 복원 — CI-4를 지키기
+
+> 이 절은 §5.1~5.4를 다 치고 테스트가 green인 **뒤에** 읽어라. 코드를 읽다가 발견한 결함을 고치는 절이다.
+
+#### 결함
+
+`TransactionManager`의 카운터는 메모리에만 있다:
+
+```kotlin
+private val nextTxId = AtomicLong(1)
+```
+
+프로세스를 재시작하면 **다시 1부터** 발급한다. 그런데 로그 파일에는 이전 실행의 txId 1, 2, 3…이 이미 남아 있다. 결과적으로 로그에 **서로 다른 두 트랜잭션이 같은 txId**로 기록된다.
+
+Recovery는 txId 기준으로 판정한다(`committed` / `aborted` 집합). 그래서 이런 시나리오가 성립한다:
+
+1. 1차 실행: tx 1이 INSERT → COMMIT. 정상 종료.
+2. 2차 실행: 카운터가 1로 리셋 → 새 트랜잭션도 tx 1. INSERT만 하고 **crash** (COMMIT 없음).
+3. Recovery: 로그에 `CommitTx(1)`이 있다(1차 실행 것) → 2차 실행의 미커밋 INSERT를 **커밋된 것으로 오판해 반영**한다.
+
+CI-1(atomicity)이 깨진다. 그것도 조용히 — 기존 테스트 5개는 "재시작 후 새 begin()" 경로를 밟지 않아서 전부 green이다. **테스트가 통과하는 것과 검증된 것은 다르다.**
+
+`LogManager`는 같은 문제를 LSN에 대해서는 이미 풀었다 — `init`이 파일을 스캔해서 `nextLsn = count + 1`로 복원한다. txId만 빠진 비대칭이다.
+
+#### 수정 — 같은 스캔에서 max txId도 읽는다
+
+모든 레코드가 `[tag][txId]` 헤더로 시작한다(`HEADER_BYTES`). `init` 스캔이 지금은 본문 전체를 `skipBytes`하는데, 헤더 9바이트만 읽고 나머지를 건너뛰면 추가 비용 없이 max txId를 얻는다. Checkpoint의 txId 자리는 placeholder 0이라 max에 영향이 없다.
+
+`LogManager`에서 바뀌는 부분:
+
+```kotlin
+class LogManager(path: String) : Closeable {
+
+    // ... companion object, file 그대로 ...
+    @Volatile private var nextLsn: Long = 1
+    @Volatile private var maxTxIdSeen: Long = 0   // 추가: 스캔에서 본 최대 txId (0 = 없음)
+
+    init {
+        file.seek(0)
+        var count = 0L
+        while (file.filePointer < file.length()) {
+            try {
+                val len = file.readInt()
+                file.readByte()                       // tag — 값은 필요 없다
+                val txId = file.readLong()            // 헤더의 txId
+                if (txId > maxTxIdSeen) maxTxIdSeen = txId
+                file.skipBytes(len - HEADER_BYTES)    // 나머지 본문만 건너뛴다
+                count++
+            } catch (_: EOFException) { break }
+        }
+        nextLsn = count + 1
+        file.seek(file.length())
+    }
+
+    /** 스캔 시점까지 로그에 존재한 최대 txId. 로그가 비어 있으면 0. */
+    fun maxTxId(): Long = maxTxIdSeen
+
+    // ... append / sync / currentLsn / replay / encode / decode 그대로 ...
+}
+```
+
+`TransactionManager`는 초기값을 로그에서 받는다:
+
+```kotlin
+class TransactionManager(private val logManager: LogManager) {
+    private val nextTxId = AtomicLong(logManager.maxTxId() + 1)
+    fun begin(): Transaction = Transaction(nextTxId.getAndIncrement(), logManager)
+}
+```
+
+빈 로그면 `maxTxId() = 0` → 1부터 시작. 기존 동작과 같다. 로그에 tx 3까지 있었으면 → 4부터. 이제 txId는 로그 수명 전체에서 단조 증가한다.
+
+`init` 이후에 append된 레코드의 txId는 `maxTxIdSeen`에 반영되지 않지만 문제없다 — 그 txId들은 전부 이 프로세스의 `TransactionManager`가 발급한 것이라 카운터가 이미 알고 있다. `maxTxId()`는 "재시작 시점의 로그 상태"를 알려주는 용도다.
+
+#### 검증 테스트
+
+`WalRecoveryTest`에 추가한다. 위 결함 시나리오를 그대로 재현하되, 고친 뒤에는 2차 실행의 트랜잭션이 **다른 txId**를 받아 오판이 사라지는지를 확인한다.
+
+```kotlin
+    @Test
+    fun `재시작 후 begin은 로그의 txId를 이어간다 (CI-4)`(@TempDir tempDir: Path) {
+        val log = tempDir.resolve("wal.log").toString()
+        val data = tempDir.resolve("u.data").toString()
+        // 1차 실행: tx 1 commit
+        LogManager(log).use { lm ->
+            PagedFile(data).use { pf -> BufferPool(pf, 16).use { bp ->
+                val heap = TableHeap(schema, pf, bp)
+                val tx = TransactionManager(lm).begin()
+                assertEquals(1L, tx.id)
+                tx.insert("users", heap, Tuple(schema, listOf(1L, "A")))
+                tx.commit()
+            }}
+        }
+        // 2차 실행(재시작): 새 tx는 2를 받아야 한다. INSERT만 하고 crash.
+        LogManager(log).use { lm ->
+            PagedFile(data).use { pf -> BufferPool(pf, 16).use { bp ->
+                val heap = TableHeap(schema, pf, bp)
+                val tx = TransactionManager(lm).begin()
+                assertEquals(2L, tx.id)   // 고치기 전엔 1 — 여기서 먼저 실패한다
+                tx.insert("users", heap, Tuple(schema, listOf(2L, "B")))
+                // commit 없음 = crash
+            }}
+        }
+        // 3차 실행: recovery — 커밋된 tx 1의 1행만 살아야 한다
+        java.io.File(data).delete()
+        LogManager(log).use { lm ->
+            PagedFile(data).use { pf -> BufferPool(pf, 16).use { bp ->
+                val heap = TableHeap(schema, pf, bp)
+                val stats = Recovery(lm) { name -> if (name == "users") heap else null }.recover()
+                assertEquals(1, stats.txCommitted)
+                assertEquals(1, stats.rowsReapplied)   // 고치기 전엔 2 — tx 1의 commit이 2차 INSERT까지 덮는다
+                assertEquals(1, heap.rowCount())
+            }}
+        }
+    }
+```
+
+**먼저 고치기 전에 돌려서 빨간 것을 확인하라.** `assertEquals(2L, tx.id)`에서 실패해야 한다. 그 줄을 잠시 지우고 돌리면 `rowsReapplied`가 2로 나와서 오판이 실제로 일어나는 것도 볼 수 있다. 그다음 §5.5 수정을 넣고 green을 확인한다.
+
+**기대 결과**: `WalRecoveryTest` **6 PASSED**
+
 ## 6. 검증 테스트 (TDD step 4 — green)
 
 테스트 파일은 §4에서 저장한 것이 그대로 최종본이다.
@@ -586,5 +708,6 @@ heap에 남는 것은 **abort한 트랜잭션의 데이터와, 커밋도 abort�
 - recovery를 **두 번 돌리면** 같은 INSERT가 두 번 적용된다. 멱등(idempotent)이 아니다.
 - 로그가 무한히 자란다. 재시작할 때마다 **처음부터 전부** 재생한다.
 - 로그 레코드에 순번(LSN)이 없어서 "어디까지 적용했는지"를 기록할 수 없다.
+- txId 복원(§5.5)은 로그 **전체 스캔**에 얹혀 있다. 로그가 커지면 이 스캔 자체가 08-02 체크포인트로 잘려야 하고, 그때 max txId도 체크포인트에 실어야 한다(PostgreSQL이 nextXid를 checkpoint 레코드에 기록하는 것과 같은 이유). 08-02는 이 부분을 다루지 않으므로 **직접 이어가야 할 과제**다.
 
-→ **08-02 LSN + Checkpoint + IdempotentRecovery**가 이 셋을 한꺼번에 다룬다.
+→ **08-02 LSN + Checkpoint + IdempotentRecovery**가 앞의 셋을 한꺼번에 다룬다.
